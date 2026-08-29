@@ -1,0 +1,173 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_A: ghcr.io/shabbiralam1999/service-a
+  IMAGE_B: ghcr.io/shabbiralam1999/service-b
+
+jobs:
+
+  lint-manifests:
+    name: Lint Kubernetes manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -L \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: Install kustomize
+        run: |
+          curl -s \
+            https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh \
+            | bash
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Lint base
+        working-directory: Devops Assessment
+        run: |
+          kustomize build k8s/base \
+            | kubeconform \
+              -strict \
+              -ignore-missing-schemas \
+              -summary
+
+      - name: Lint staging
+        working-directory: Devops Assessment
+        run: |
+          kustomize build k8s/overlays/staging \
+            | kubeconform \
+              -strict \
+              -ignore-missing-schemas \
+              -summary
+
+      - name: Lint production
+        working-directory: Devops Assessment
+        run: |
+          kustomize build k8s/overlays/production \
+            | kubeconform \
+              -strict \
+              -ignore-missing-schemas \
+              -summary
+
+
+  build-and-scan:
+    name: Build and scan container images
+    needs: lint-manifests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - name: service-a
+            context: Devops Assessment/docker/service-a
+            image: ghcr.io/shabbiralam1999/service-a
+
+          - name: service-b
+            context: Devops Assessment/docker/service-b
+            image: ghcr.io/shabbiralam1999/service-b
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        run: |
+          echo "TAG=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: |
+          docker build \
+            -t "${{ matrix.image }}:${{ env.TAG }}" \
+            "${{ matrix.context }}"
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ matrix.image }}:${{ env.TAG }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push'
+        run: |
+          docker push "${{ matrix.image }}:${{ env.TAG }}"
+
+
+  update-production-overlay:
+    name: Update production image tags
+    needs: build-and-scan
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: Install kustomize
+        run: |
+          curl -s \
+            https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh \
+            | bash
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Update production images
+        working-directory: Devops Assessment/k8s/overlays/production
+        run: |
+          TAG="${GITHUB_SHA::8}"
+
+          kustomize edit set image \
+            ghcr.io/shabbiralam1999/service-a=ghcr.io/shabbiralam1999/service-a:${TAG}
+
+          kustomize edit set image \
+            ghcr.io/shabbiralam1999/service-b=ghcr.io/shabbiralam1999/service-b:${TAG}
+
+      - name: Commit production image update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "Devops Assessment/k8s/overlays/production/kustomization.yaml"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "ci: bump production images to ${GITHUB_SHA::8}"
+            git push
+          fi
