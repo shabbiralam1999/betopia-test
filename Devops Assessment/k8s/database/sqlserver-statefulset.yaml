@@ -1,0 +1,68 @@
+# ============================================================================
+# Task 3: SQL Server stateful workload (third database engine).
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sqlserver-credentials
+  namespace: data
+type: Opaque
+stringData:
+  sa-password: CHANGE_ME_use_sealed_secrets_or_ESO   # must satisfy MSSQL complexity rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlserver
+  namespace: data
+spec:
+  clusterIP: None
+  selector: { app: sqlserver }
+  ports:
+    - port: 1433
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sqlserver
+  namespace: data
+spec:
+  serviceName: sqlserver
+  replicas: 1
+  selector:
+    matchLabels: { app: sqlserver }
+  template:
+    metadata:
+      labels: { app: sqlserver }
+    spec:
+      containers:
+        - name: sqlserver
+          image: mcr.microsoft.com/mssql/server:2022-latest
+          ports: [{ containerPort: 1433 }]
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: Developer
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: sqlserver-credentials, key: sa-password } }
+          resources:
+            requests: { cpu: 500m, memory: 2Gi }
+            limits:   { cpu: "2",  memory: 4Gi }
+          readinessProbe:
+            exec:
+              command:
+                - /opt/mssql-tools/bin/sqlcmd
+                - -S localhost -U sa -P "$(SA_PASSWORD)" -Q "SELECT 1"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: mssql-data
+              mountPath: /var/opt/mssql
+  volumeClaimTemplates:
+    - metadata: { name: mssql-data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests: { storage: 30Gi }

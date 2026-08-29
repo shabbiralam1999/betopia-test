@@ -1,0 +1,38 @@
+# ============================================================================
+# Task 4: Alertmanager routing — critical alerts page immediately, warnings
+# batch into a Slack channel. Swap the slack_api_url for your real webhook
+# (store it as a Secret in production, not inline, as done here for demo
+# clarity).
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: observability
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: slack-warnings
+      group_by: [alertname, namespace]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers: [severity="critical"]
+          receiver: pagerduty-critical
+          repeat_interval: 1h
+
+    receivers:
+      - name: slack-warnings
+        slack_configs:
+          - api_url: https://hooks.slack.com/services/CHANGE_ME
+            channel: "#alerts-warning"
+            send_resolved: true
+
+      - name: pagerduty-critical
+        pagerduty_configs:
+          - service_key: CHANGE_ME
+            send_resolved: true

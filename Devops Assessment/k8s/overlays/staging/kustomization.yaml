@@ -1,0 +1,46 @@
+# ============================================================================
+# Task 5: Staging overlay — smaller footprint, latest-branch image tag,
+# a staging hostname on the Ingress.
+# ============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Deliberately NO namePrefix here. Several manifests hardcode a literal
+# `metadata.namespace: app|data|observability` (see k8s/base/kustomization.yaml's
+# note on why there's no blanket `namespace:` transformer), and the CloudNativePG
+# Cluster CR references its bootstrap Secret by name in a custom CRD field
+# (`spec.bootstrap.initdb.secret.name`) that kustomize's built-in name-reference
+# transformer does not know how to rewrite. A namePrefix would silently detach
+# that Secret reference and rename the Namespace objects out from under the
+# resources that still say `namespace: app`. Staging is distinguished from
+# production by image tag, replica count, and Ingress host instead — see
+# the patches below.
+
+patches:
+  - target: { kind: Deployment, name: service-a }
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: { kind: Deployment, name: service-b }
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: { kind: Ingress, name: app-ingress }
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: staging-api.acme.example.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: staging-api.acme.example.com
+
+images:
+  - name: ghcr.io/acme/service-a
+    newTag: staging
+  - name: ghcr.io/acme/service-b
+    newTag: staging

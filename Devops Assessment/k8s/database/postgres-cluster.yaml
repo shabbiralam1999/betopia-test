@@ -1,0 +1,70 @@
+# ============================================================================
+# Task 3: PostgreSQL High Availability via the CloudNativePG operator.
+# CNPG manages the StatefulSet, streaming replication, automatic failover,
+# and PVCs for us — this is the CR that drives all of that.
+# (Operator install: scripts/bootstrap.sh installs cloudnative-pg via Helm.)
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-app-credentials
+  namespace: data
+type: kubernetes.io/basic-auth
+stringData:
+  username: app_user
+  password: CHANGE_ME_use_sealed_secrets_or_ESO   # see note below
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  instances: 3                       # 1 primary + 2 streaming replicas
+  primaryUpdateStrategy: unsupervised
+
+  # CNPG generates and manages its own pods, so they don't automatically
+  # carry a plain `app: postgres` label. inheritedMetadata propagates one
+  # onto every pod/PVC/service this Cluster creates, which is what the
+  # `app: postgres` podSelectors in k8s/base/networkpolicy.yaml actually
+  # match against — without this, those NetworkPolicies would silently
+  # select zero pods and do nothing.
+  inheritedMetadata:
+    labels:
+      app: postgres
+
+  storage:
+    size: 20Gi
+    storageClass: gp3
+    # PVC reclaim policy — keep data if the Cluster CR is deleted by mistake.
+    # (CNPG applies this via the underlying StorageClass's reclaimPolicy:
+    #  see storageclass-retain.yaml)
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app_user
+      secret:
+        name: postgres-app-credentials
+
+  monitoring:
+    enablePodMonitor: true            # scraped by Prometheus, see Task 4
+
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
+
+  affinity:
+    podAntiAffinityType: required     # never co-locate replicas on one node
+    topologyKey: kubernetes.io/hostname
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+allowVolumeExpansion: true
+reclaimPolicy: Retain               # data survives PVC/PV deletion mistakes
+volumeBindingMode: WaitForFirstConsumer

@@ -1,0 +1,127 @@
+# ============================================================================
+# Task 4: Fluent Bit as a cluster-wide DaemonSet — one pod per node,
+# tailing container stdout/stderr, parsing JSON app logs, enriching with
+# Kubernetes metadata, and shipping to Loki.
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit
+subjects:
+  - kind: ServiceAccount
+    name: fluent-bit
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: observability
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Log_Level     info
+        Parsers_File  parsers.conf
+
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log
+        Parser            docker
+        Tag               kube.*
+        Mem_Buf_Limit     10MB
+        Skip_Long_Lines   On
+
+    # Extract structured JSON fields the app already emits
+    # (timestamp, level, trace_id, caller, request_id).
+    [FILTER]
+        Name          parser
+        Match         kube.*
+        Key_Name      log
+        Parser        app_json
+        Reserve_Data  On
+
+    # Enrich every record with pod name, namespace, labels, container name.
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Merge_Log           On
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        Labels              On
+        Annotations         Off
+
+    [OUTPUT]
+        Name            loki
+        Match           kube.*
+        Host            loki.observability.svc.cluster.local
+        Port            3100
+        Labels          job=fluentbit, namespace=$kubernetes['namespace_name'], pod=$kubernetes['pod_name']
+        Line_format     json
+
+  parsers.conf: |
+    [PARSER]
+        Name        docker
+        Format      json
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L
+
+    [PARSER]
+        Name        app_json
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        # Expected keys extracted: timestamp, level, trace_id, caller, request_id
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: observability
+spec:
+  selector:
+    matchLabels: { app: fluent-bit }
+  template:
+    metadata:
+      labels: { app: fluent-bit }
+    spec:
+      serviceAccountName: fluent-bit
+      tolerations:
+        - operator: Exists     # run on all nodes, incl. tainted control-plane
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.1
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 300m, memory: 256Mi }
+          volumeMounts:
+            - { name: varlog,      mountPath: /var/log }
+            - { name: containers,  mountPath: /var/lib/docker/containers, readOnly: true }
+            - { name: config,      mountPath: /fluent-bit/etc/ }
+      volumes:
+        - name: varlog
+          hostPath: { path: /var/log }
+        - name: containers
+          hostPath: { path: /var/lib/docker/containers }
+        - name: config
+          configMap: { name: fluent-bit-config }

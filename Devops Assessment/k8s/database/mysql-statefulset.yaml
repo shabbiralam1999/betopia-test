@@ -1,0 +1,71 @@
+# ============================================================================
+# Task 3: MySQL stateful workload — plain StatefulSet (no operator), to
+# demonstrate the "multi-engine" requirement without relying on CNPG-style
+# tooling that doesn't exist for MySQL in this stack.
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-app-credentials
+  namespace: data
+type: Opaque
+stringData:
+  username: app_user
+  password: CHANGE_ME_use_sealed_secrets_or_ESO
+  root-password: CHANGE_ME_use_sealed_secrets_or_ESO
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: data
+spec:
+  clusterIP: None                 # headless — required for StatefulSet DNS
+  selector: { app: mysql }
+  ports:
+    - port: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: data
+spec:
+  serviceName: mysql
+  replicas: 1                     # single-primary; add read replicas + orchestrator for HA
+  selector:
+    matchLabels: { app: mysql }
+  template:
+    metadata:
+      labels: { app: mysql }
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports: [{ containerPort: 3306 }]
+          env:
+            - name: MYSQL_DATABASE
+              value: appdb
+            - name: MYSQL_USER
+              valueFrom: { secretKeyRef: { name: mysql-app-credentials, key: username } }
+            - name: MYSQL_PASSWORD
+              valueFrom: { secretKeyRef: { name: mysql-app-credentials, key: password } }
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: mysql-app-credentials, key: root-password } }
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          readinessProbe:
+            exec: { command: ["mysqladmin", "ping", "-h", "127.0.0.1"] }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata: { name: mysql-data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests: { storage: 20Gi }

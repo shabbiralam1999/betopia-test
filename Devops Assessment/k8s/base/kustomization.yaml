@@ -1,0 +1,31 @@
+# ============================================================================
+# Task 5: Base Kustomization — the common, environment-agnostic manifests.
+# Staging/production overlays patch this base rather than duplicating it.
+# ============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# NOTE: no top-level `namespace:` override here — resources deliberately
+# span three namespaces (app / data / observability), each set per-manifest.
+# A blanket `namespace:` field would force everything into one namespace.
+
+resources:
+  - namespaces.yaml
+  - deployment-service-a.yaml
+  - deployment-service-b.yaml
+  - hpa.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+  - ../database/postgres-cluster.yaml
+  - ../database/mysql-statefulset.yaml
+  - ../database/sqlserver-statefulset.yaml
+  - ../backup/backup-cronjob.yaml
+  - ../observability/fluent-bit-daemonset.yaml
+  - ../observability/prometheus-alert-rules.yaml
+  - ../observability/alertmanager-config.yaml
+
+images:
+  - name: ghcr.io/acme/service-a
+    newTag: __IMAGE_TAG__
+  - name: ghcr.io/acme/service-b
+    newTag: __IMAGE_TAG__

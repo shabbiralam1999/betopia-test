@@ -1,0 +1,110 @@
+# ============================================================================
+# Task 3: Automated daily backup — logical dumps of all three engines,
+# gzip-compressed, pushed to an S3-compatible bucket. Runs 02:00 UTC.
+# Credentials come from Secrets (see k8s/database/secret-management.md) —
+# never hard-coded here.
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-backup-credentials
+  namespace: data
+type: Opaque
+stringData:
+  access-key-id: CHANGE_ME_use_sealed_secrets_or_ESO
+  secret-access-key: CHANGE_ME_use_sealed_secrets_or_ESO
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+  namespace: data
+spec:
+  schedule: "0 2 * * *"          # 02:00 UTC daily
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          # Labeled so the NetworkPolicies in k8s/base/networkpolicy.yaml can
+          # grant this job — and only this job — ingress to the database
+          # pods, without having to open them up to the whole namespace.
+          labels:
+            app: db-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+          containers:
+            - name: db-backup
+              image: ghcr.io/acme/db-backup-tools:latest   # bundles pg_dump, mysqldump, sqlcmd, aws-cli
+              env:
+                - name: BACKUP_DATE
+                  value: "$(date +%F)"
+                - name: S3_BUCKET
+                  value: s3://acme-db-backups
+                - name: PGHOST
+                  value: postgres-rw.data.svc.cluster.local
+                - name: PGUSER
+                  valueFrom: { secretKeyRef: { name: postgres-app-credentials, key: username } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: postgres-app-credentials, key: password } }
+                - name: MYSQL_HOST
+                  value: mysql.data.svc.cluster.local
+                - name: MYSQL_USER
+                  valueFrom: { secretKeyRef: { name: mysql-app-credentials, key: username } }
+                - name: MYSQL_PWD
+                  valueFrom: { secretKeyRef: { name: mysql-app-credentials, key: password } }
+                - name: MSSQL_HOST
+                  value: sqlserver.data.svc.cluster.local
+                - name: MSSQL_SA_PASSWORD
+                  valueFrom: { secretKeyRef: { name: sqlserver-credentials, key: sa-password } }
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom: { secretKeyRef: { name: s3-backup-credentials, key: access-key-id } }
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: s3-backup-credentials, key: secret-access-key } }
+              command: ["/bin/sh", "/scripts/run-backup.sh"]
+              volumeMounts:
+                - name: backup-script
+                  mountPath: /scripts
+              resources:
+                requests: { cpu: 250m, memory: 256Mi }
+                limits:   { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: backup-script
+              configMap:
+                name: db-backup-script
+                defaultMode: 0755
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-backup-script
+  namespace: data
+data:
+  run-backup.sh: |
+    #!/bin/sh
+    set -eu
+    STAMP=$(date +%F_%H%M%S)
+
+    echo "[backup] dumping postgres..."
+    pg_dump -h "$PGHOST" -U "$PGUSER" appdb | gzip > "/tmp/postgres_${STAMP}.sql.gz"
+
+    echo "[backup] dumping mysql..."
+    mysqldump -h "$MYSQL_HOST" -u "$MYSQL_USER" appdb | gzip > "/tmp/mysql_${STAMP}.sql.gz"
+
+    echo "[backup] dumping sqlserver..."
+    /opt/mssql-tools/bin/sqlcmd -S "$MSSQL_HOST" -U sa -P "$MSSQL_SA_PASSWORD" \
+      -Q "BACKUP DATABASE appdb TO DISK = N'/tmp/mssql_${STAMP}.bak'"
+    gzip "/tmp/mssql_${STAMP}.bak"
+
+    echo "[backup] uploading to $S3_BUCKET ..."
+    aws s3 cp "/tmp/postgres_${STAMP}.sql.gz" "$S3_BUCKET/postgres/"
+    aws s3 cp "/tmp/mysql_${STAMP}.sql.gz"    "$S3_BUCKET/mysql/"
+    aws s3 cp "/tmp/mssql_${STAMP}.bak.gz"    "$S3_BUCKET/mssql/"
+
+    echo "[backup] done."

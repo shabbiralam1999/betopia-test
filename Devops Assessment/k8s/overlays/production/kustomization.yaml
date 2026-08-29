@@ -1,0 +1,27 @@
+# ============================================================================
+# Task 5: Production overlay — full replica counts (inherited from base),
+# git-SHA-pinned image tag (injected by CI), production hostname.
+# ============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - target: { kind: HorizontalPodAutoscaler, name: service-a-hpa }
+    patch: |
+      - op: replace
+        path: /spec/maxReplicas
+        value: 20
+  - target: { kind: HorizontalPodAutoscaler, name: service-b-hpa }
+    patch: |
+      - op: replace
+        path: /spec/maxReplicas
+        value: 20
+
+images:
+  - name: ghcr.io/acme/service-a
+    newTag: __GIT_SHA__          # set by CI: kustomize edit set image
+  - name: ghcr.io/acme/service-b
+    newTag: __GIT_SHA__

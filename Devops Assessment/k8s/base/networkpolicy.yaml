@@ -1,0 +1,158 @@
+# ============================================================================
+# Task 2: Zero-Trust NetworkPolicies
+# Default posture: deny everything, then explicitly allow only what's needed.
+#   - service-a: ingress ONLY from the nginx ingress controller
+#   - service-a: egress ONLY to the Postgres port
+#   - service-b: ingress ONLY from the nginx ingress controller
+#   - service-b: egress ONLY to the MySQL port
+#   - only service-a (+ the backup job) may reach Postgres; only service-b
+#     (+ the backup job) may reach MySQL; only the backup job may reach
+#     SQL Server, since no application service talks to it directly
+#   - Postgres pods may additionally reach EACH OTHER on 5432: CloudNativePG's
+#     streaming replication (walreceiver on each replica connecting to the
+#     primary) is itself pod-to-pod traffic within the "data" namespace, and
+#     a naive "only service-a" rule would block that just as effectively as
+#     it blocks anyone else — this was caught and fixed in review.
+# ============================================================================
+
+# ---- default-deny baseline for the app namespace ---------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: app
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: service-a-policy
+  namespace: app
+spec:
+  podSelector:
+    matchLabels: { app: service-a }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: data }
+          podSelector:
+            matchLabels: { app: postgres }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:  # DNS
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: service-b-policy
+  namespace: app
+spec:
+  podSelector:
+    matchLabels: { app: service-b }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8081 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: data }
+          podSelector:
+            matchLabels: { app: mysql }
+      ports:
+        - { protocol: TCP, port: 3306 }
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+
+---
+# ---- database-side lock-down: only the owning service (+ backups) may connect
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-allow-service-a-only
+  namespace: data
+spec:
+  podSelector:
+    matchLabels: { app: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: app }
+          podSelector:
+            matchLabels: { app: service-a }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - from:  # the daily backup CronJob (Task 3) — same namespace, no namespaceSelector needed
+        - podSelector:
+            matchLabels: { app: db-backup }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - from:  # CNPG streaming replication: replicas <-> primary, same namespace
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports:
+        - { protocol: TCP, port: 5432 }
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mysql-allow-service-b-only
+  namespace: data
+spec:
+  podSelector:
+    matchLabels: { app: mysql }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: app }
+          podSelector:
+            matchLabels: { app: service-b }
+      ports:
+        - { protocol: TCP, port: 3306 }
+    - from:  # the daily backup CronJob (Task 3)
+        - podSelector:
+            matchLabels: { app: db-backup }
+      ports:
+        - { protocol: TCP, port: 3306 }
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sqlserver-allow-backup-only
+  namespace: data
+spec:
+  podSelector:
+    matchLabels: { app: sqlserver }
+  policyTypes: [Ingress]
+  ingress:
+    # No application service connects to SQL Server directly in this design
+    # (it's provisioned to satisfy the multi-engine requirement and is
+    # exercised by the backup job) — so its only permitted caller is backup.
+    - from:
+        - podSelector:
+            matchLabels: { app: db-backup }
+      ports:
+        - { protocol: TCP, port: 1433 }

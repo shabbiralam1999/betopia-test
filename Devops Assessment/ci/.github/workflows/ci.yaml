@@ -1,0 +1,122 @@
+# ============================================================================
+# Task 5: CI Pipeline
+#   1. Lint all Kubernetes manifests (kubeconform) + Helm-style values
+#   2. Vulnerability-scan both container images (Trivy)
+#   3. Build + push images tagged with the git commit SHA
+#   4. (main branch only) bump the production overlay to the new SHA
+# ============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+# GITHUB_TOKEN defaults to read-only on repos created since Feb 2023 —
+# without this, "docker push" to GHCR fails with 403 regardless of repo
+# settings. Declared workflow-wide; each job narrows further if it needs
+# less.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_A: ghcr.io/acme/service-a
+  IMAGE_B: ghcr.io/acme/service-b
+
+jobs:
+  lint-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Render + lint base
+        run: kustomize build k8s/base | kubeconform -strict -ignore-missing-schemas -summary
+
+      - name: Render + lint staging overlay
+        run: kustomize build k8s/overlays/staging | kubeconform -strict -ignore-missing-schemas -summary
+
+      - name: Render + lint production overlay
+        run: kustomize build k8s/overlays/production | kubeconform -strict -ignore-missing-schemas -summary
+
+  build-and-scan:
+    needs: lint-manifests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: service-a
+            context: docker/service-a
+            image: ghcr.io/acme/service-a
+          - name: service-b
+            context: docker/service-b
+            image: ghcr.io/acme/service-b
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag (short git SHA)
+        run: echo "TAG=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -t ${{ matrix.image }}:${{ env.TAG }} ${{ matrix.context }}
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ matrix.image }}:${{ env.TAG }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"          # fail the build on unpatched critical/high CVEs
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push'
+        run: docker push ${{ matrix.image }}:${{ env.TAG }}
+
+  update-production-overlay:
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Pin production images to this commit SHA
+        run: |
+          TAG=${GITHUB_SHA::8}
+          cd k8s/overlays/production
+          kustomize edit set image ghcr.io/acme/service-a=ghcr.io/acme/service-a:$TAG
+          kustomize edit set image ghcr.io/acme/service-b=ghcr.io/acme/service-b:$TAG
+
+      - name: Commit GitOps update
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@acme.example.com"
+          git commit -am "ci: bump production images to ${GITHUB_SHA::8}" || echo "nothing to commit"
+          git push

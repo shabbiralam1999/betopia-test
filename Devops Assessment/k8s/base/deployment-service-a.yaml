@@ -1,0 +1,108 @@
+# ============================================================================
+# Task 2: Deployment for Service A
+# - strict resource requests/limits
+# - tuned readiness/liveness probes
+# - zero-downtime rolling update (maxSurge 25%, maxUnavailable 0)
+# - pod anti-affinity across nodes (HA scheduling)
+# - hardened securityContext matching the distroless image (UID 10001,
+#   read-only root fs, all capabilities dropped)
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-a
+  namespace: app
+  labels:
+    app: service-a
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: service-a
+  template:
+    metadata:
+      labels:
+        app: service-a
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: [service-a]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: service-a
+          image: ghcr.io/acme/service-a:__IMAGE_TAG__
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: DB_HOST
+              value: postgres-rw.data.svc.cluster.local
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: postgres-app-credentials, key: username }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: postgres-app-credentials, key: password }
+          resources:
+            requests:
+              cpu: 150m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          readinessProbe:
+            httpGet: { path: /healthz/ready, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Only writable path the process ever needs (scratch space), since
+        # the root filesystem itself is read-only.
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-a
+  namespace: app
+spec:
+  selector:
+    app: service-a
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
