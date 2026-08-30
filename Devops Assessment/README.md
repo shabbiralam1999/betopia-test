@@ -40,7 +40,7 @@ k8s/                         Task 2–5 — all cluster manifests
     staging/kustomization.yaml
     production/kustomization.yaml
 
-ci/.github/workflows/ci.yaml  Task 5 — lint, scan, build, tag, promote
+/.github/workflows/ci.yaml  Task 5 — lint, scan, build, tag, promote
 
 scripts/
   bootstrap.sh                 ONE-CLICK setup (Task: required deliverable)
